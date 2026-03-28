@@ -4305,7 +4305,7 @@ class LinearAttentionBlock(nn.Module):
 
         # Y_t = (Q_t * S_t) / (Q_t * Z_t)
         num = torch.einsum("bthd,bthde->bthe", Q, S)
-        den = torch.einsum("bthd,bthd->bth", Q, K_sum) + 1e-6
+        den = torch.einsum("bthd,bthd->bth", Q, K_sum).clamp(min=1e-4)
         
         y = num / den.unsqueeze(-1)
         y = y.reshape(B, T, C)
@@ -4354,8 +4354,8 @@ class H3Block(nn.Module):
         self.v_proj = nn.Linear(dim, dim)
         self.out_proj = nn.Linear(dim, dim)
         
-        # Shift SSM (Local convolution)
-        self.shift_conv = nn.Conv1d(dim, dim, kernel_size=3, padding=1, groups=dim)
+        # Shift SSM (Causal convolution — padding on the left only)
+        self.shift_conv = nn.Conv1d(dim, dim, kernel_size=3, padding=0, groups=dim)
         
         # Diagonal SSM parameters
         self.dt_proj = nn.Linear(dim, dim)
@@ -4379,27 +4379,27 @@ class H3Block(nn.Module):
         k = self.k_proj(x)
         v = self.v_proj(x)
         
-        # 1. Shift-SSM on K (Local Context)
+        # 1. Shift-SSM on K (Causal Local Context — left-padded conv)
         if buf is None:
-            # Training / Fresh
+            # Training / Fresh — pad 2 zeros on the left for causal kernel_size=3
             k_T = k.transpose(1, 2)
-            # Remove lookahead padding
-            k_shift = self.shift_conv(k_T).transpose(1, 2)
+            k_T_padded = F.pad(k_T, (2, 0))  # (left=2, right=0)
+            k_shift = self.shift_conv(k_T_padded).transpose(1, 2)
             # Create buffer for next step (last 2 tokens)
             new_buf = k[:, -2:, :]
         else:
-            # Step
+            # Step — prepend buffer for causal context
             k_cat = torch.cat([buf, k], dim=1)
             k_shift = self.shift_conv(k_cat.transpose(1, 2)).transpose(1, 2)[:, -x.shape[1]:, :]
-            new_buf = k_cat[:, 1:, :]
+            new_buf = k_cat[:, -2:, :]
 
         # 2. Diagonal SSM on V * K_shifted
         x_ssm = v * k_shift
         
         # Parameters
         dt = F.softplus(self.dt_proj(x_ssm))
-        A = -torch.exp(self.A_log)
-        D_decay = torch.exp(A * dt) # discretized decay
+        A = -torch.exp(self.A_log.clamp(max=5.0))
+        D_decay = torch.exp((A * dt).clamp(min=-30.0, max=0.0))  # bounded decay in (0, 1]
         
         # Scan: h_t = D_decay * h_{t-1} + x_ssm
         h = parallel_scan_linear(D_decay, x_ssm, rnn_state)

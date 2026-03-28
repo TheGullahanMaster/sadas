@@ -1972,6 +1972,17 @@ def train_loop(cfg, model, optimizer, dataset, valid_ds, vocab, line_mode):
                         logits = model(x)
 
                 loss = criterion(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
+
+                # NaN/Inf guard — skip the step entirely to avoid poisoning optimizer state
+                if torch.isnan(loss) or torch.isinf(loss):
+                    if iters == 0:
+                        print(f"[WARNING] NaN/Inf loss at first step — model may be numerically unstable")
+                    else:
+                        print(f"[WARNING] NaN/Inf loss at iter {iters+1} — skipping step")
+                    optimizer.zero_grad(set_to_none=True)
+                    iters += 1
+                    continue
+
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -2390,10 +2401,14 @@ def build_config_new():
     print(f"  │  {_c(_DIM, 'Batch size — sequences processed per gradient step.')}")
     print(f"  │  {_c(_DIM, 'Larger batches = more stable gradients but more VRAM.')}")
     batch_size    = prompt_int("Batch size")
-    print(f"  │")
-    print(f"  │  {_c(_DIM, 'Learning rate — step size for the Prodigy optimiser.')}")
-    print(f"  │  {_c(_DIM, 'Prodigy auto-scales internally; 1.0 is almost always correct.')}")
-    learning_rate = prompt_float("Learning rate  (Prodigy — 1.0 is usually fine)", default=1.0)
+    cli_section_end(64)
+
+    # ── Optimizer ──────────────────────────────────────────────────────────────
+    optim_cfg = prompt_optimizer_config()
+    learning_rate = optim_cfg["optim_params"].get("lr", 1.0)
+
+    # ── Sampling ──────────────────────────────────────────────────────────────
+    cli_section("Sampling", 64)
 
     print(f"  │")
     print(f"  │  {_c(_DIM, 'During-training sampling — periodically generates text so you can')}")
@@ -2528,6 +2543,9 @@ def build_config_new():
     cfg["log_interval"]      = log_interval
     cfg["sample_interval"]   = sample_interval_val
     cfg["val_interval"]      = val_interval_val
+
+    cfg["optimizer"]         = optim_cfg["optimizer"]
+    cfg["optim_params"]      = optim_cfg["optim_params"]
 
     if tokenizer_mode == 3: cfg["tiktoken_encoding"] = tke
     if tokenizer_mode == 0: cfg["byte_output_text"]  = bool(byte_out == 1)
@@ -2791,17 +2809,140 @@ def resume_adjustments(cfg, _model):
     return cfg
 
 
+# ── Optimizer Registry ────────────────────────────────────────────────────────
+# Each entry: { "name": str, "class": callable_or_str, "defaults": {param: value},
+#               "params": [ { "key": str, "prompt": str, "type": "float"|"int", "default": value } ] }
+# To add a new optimizer: append an entry here and it will appear in the menu automatically.
+
+OPTIMIZER_REGISTRY = [
+    {
+        "name": "Prodigy",
+        "class": "prodigy",
+        "defaults": {"lr": 1.0},
+        "params": [
+            {"key": "lr",      "prompt": "Learning rate  (Prodigy auto-scales; 1.0 is usually fine)", "type": "float", "default": 1.0},
+            {"key": "slice_p", "prompt": "Slice P  (gradient slicing factor)", "type": "int", "default": 8},
+        ],
+    },
+    {
+        "name": "Adam",
+        "class": "adam",
+        "defaults": {"lr": 3e-4},
+        "params": [
+            {"key": "lr",      "prompt": "Learning rate", "type": "float", "default": 3e-4},
+            {"key": "betas",   "prompt": "Betas  (comma-separated, e.g. 0.9,0.999)", "type": "betas", "default": (0.9, 0.999)},
+            {"key": "eps",     "prompt": "Epsilon", "type": "float", "default": 1e-8},
+            {"key": "weight_decay", "prompt": "Weight decay", "type": "float", "default": 0.0},
+        ],
+    },
+    {
+        "name": "SGD",
+        "class": "sgd",
+        "defaults": {"lr": 1e-2},
+        "params": [
+            {"key": "lr",       "prompt": "Learning rate", "type": "float", "default": 1e-2},
+            {"key": "momentum", "prompt": "Momentum", "type": "float", "default": 0.9},
+            {"key": "dampening","prompt": "Dampening", "type": "float", "default": 0.0},
+            {"key": "nesterov", "prompt": "Nesterov  (0=off 1=on)", "type": "bool", "default": False},
+            {"key": "weight_decay", "prompt": "Weight decay", "type": "float", "default": 0.0},
+        ],
+    },
+    {
+        "name": "RMSprop",
+        "class": "rmsprop",
+        "defaults": {"lr": 1e-3},
+        "params": [
+            {"key": "lr",       "prompt": "Learning rate", "type": "float", "default": 1e-3},
+            {"key": "alpha",    "prompt": "Alpha  (smoothing constant)", "type": "float", "default": 0.99},
+            {"key": "eps",      "prompt": "Epsilon", "type": "float", "default": 1e-8},
+            {"key": "momentum", "prompt": "Momentum", "type": "float", "default": 0.0},
+            {"key": "weight_decay", "prompt": "Weight decay", "type": "float", "default": 0.0},
+        ],
+    },
+    {
+        "name": "Rprop",
+        "class": "rprop",
+        "defaults": {"lr": 1e-3},
+        "params": [
+            {"key": "lr",   "prompt": "Learning rate", "type": "float", "default": 1e-3},
+            {"key": "etas", "prompt": "Etas  (comma-separated, e.g. 0.5,1.2)", "type": "betas", "default": (0.5, 1.2)},
+        ],
+    },
+    {
+        "name": "Adagrad",
+        "class": "adagrad",
+        "defaults": {"lr": 1e-2},
+        "params": [
+            {"key": "lr",                "prompt": "Learning rate", "type": "float", "default": 1e-2},
+            {"key": "lr_decay",          "prompt": "LR decay", "type": "float", "default": 0.0},
+            {"key": "eps",               "prompt": "Epsilon", "type": "float", "default": 1e-10},
+            {"key": "weight_decay",      "prompt": "Weight decay", "type": "float", "default": 0.0},
+        ],
+    },
+    {
+        "name": "Adadelta",
+        "class": "adadelta",
+        "defaults": {"lr": 1.0},
+        "params": [
+            {"key": "lr",    "prompt": "Learning rate", "type": "float", "default": 1.0},
+            {"key": "rho",   "prompt": "Rho  (decay rate)", "type": "float", "default": 0.9},
+            {"key": "eps",   "prompt": "Epsilon", "type": "float", "default": 1e-6},
+            {"key": "weight_decay", "prompt": "Weight decay", "type": "float", "default": 0.0},
+        ],
+    },
+]
+
+def _get_optimizer_names():
+    return [o["name"] for o in OPTIMIZER_REGISTRY]
+
+def _parse_optim_param(raw_str, ptype, default):
+    """Parse a single optimizer parameter from user input string."""
+    if raw_str.strip() == "":
+        return default
+    if ptype == "float":
+        return float(raw_str)
+    if ptype == "int":
+        return int(raw_str)
+    if ptype == "bool":
+        v = raw_str.strip().lower()
+        return v in ("1", "true", "yes", "y")
+    if ptype == "betas":
+        parts = [float(x.strip()) for x in raw_str.split(",")]
+        return tuple(parts)
+    return raw_str
+
+def prompt_optimizer_config():
+    """Interactive optimizer selection + per-optimizer param prompts.
+    Returns dict: {"optimizer": str, "optim_params": {key: value, ...}}
+    """
+    cli_section("Optimizer", 64)
+    print(f"  │")
+    for i, entry in enumerate(OPTIMIZER_REGISTRY):
+        desc = ", ".join(f"{p['key']}={p['default']}" for p in entry["params"][:3])
+        cli_opt(i, entry["name"], desc)
+    print(f"  │")
+    choice = prompt_int("Optimizer", valid=set(range(len(OPTIMIZER_REGISTRY))), default=0)
+    entry = OPTIMIZER_REGISTRY[choice]
+
+    print(f"  │")
+    opt_name = entry["name"]
+    print(f"  │  {_c(_DIM, f'Configure {opt_name} parameters  (press Enter for default):')}")
+    optim_params = {}
+    for p in entry["params"]:
+        label = prompt_label(p["prompt"], p["default"])
+        raw = input(label).strip()
+        optim_params[p["key"]] = _parse_optim_param(raw, p["type"], p["default"])
+
+    cli_section_end(64)
+    return {"optimizer": entry["class"], "optim_params": optim_params}
+
+
 def build_optimizer(model, cfg):
-    # Lion/Cautious Lion generally prefers higher weight decay (e.g., 1.0) 
-    # compared to AdamW (e.g., 0.1).
-    wd = 0.0
+    wd = cfg.get("optim_params", {}).get("weight_decay", 0.0)
     decay_params = []
     no_decay_params = []
-    
+
     # Substrings to identify parameters that should NOT decay
-    # 1. Embeddings: 'embed' (Input), 'pos' (Positional/Learned)
-    # 2. Normalizers: 'norm', 'ln', 'gn' (LayerNorm/RMSNorm weights/biases)
-    # 3. Gating/ReZero: 'alphas', 'betas' (BuiltinRNN), 'res_scale', 'time_mix' (RWKV), 'gamma' (RetNet)
     blacklist = [
         'embed', 'pos', 'tok',       # Embeddings (including GPT2 'tok')
         'norm', 'ln', 'gn',          # Normalization (LayerNorm, RMSNorm, GroupNorm)
@@ -2815,23 +2956,52 @@ def build_optimizer(model, cfg):
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        
-        # Check if the parameter name contains any restricted keyword
         if any(key in name for key in blacklist):
             no_decay_params.append(param)
         else:
-            # Everything else decays (Linear Weights, Biases, etc.)
             decay_params.append(param)
 
-    # Diagnostic print to ensure your embeddings are actually being protected
     print(f"[Optimizer] Decay: {len(decay_params)} tensors | No Decay: {len(no_decay_params)} tensors (Embeds/Norms/Gates)")
 
     optim_groups = [
         {'params': decay_params, 'weight_decay': wd},
         {'params': no_decay_params, 'weight_decay': 0.0}
     ]
-    
-    return Prodigy(optim_groups, lr=cfg["learning_rate"], slice_p=8)
+
+    optimizer_key = cfg.get("optimizer", "prodigy")
+    op = cfg.get("optim_params", {})
+
+    if optimizer_key == "prodigy":
+        return Prodigy(optim_groups, lr=op.get("lr", 1.0), slice_p=op.get("slice_p", 8))
+    elif optimizer_key == "adam":
+        betas = op.get("betas", (0.9, 0.999))
+        if isinstance(betas, list): betas = tuple(betas)
+        return torch.optim.Adam(optim_groups, lr=op.get("lr", 3e-4),
+                                betas=betas, eps=op.get("eps", 1e-8))
+    elif optimizer_key == "sgd":
+        return torch.optim.SGD(optim_groups, lr=op.get("lr", 1e-2),
+                               momentum=op.get("momentum", 0.9),
+                               dampening=op.get("dampening", 0.0),
+                               nesterov=op.get("nesterov", False))
+    elif optimizer_key == "rmsprop":
+        return torch.optim.RMSprop(optim_groups, lr=op.get("lr", 1e-3),
+                                   alpha=op.get("alpha", 0.99),
+                                   eps=op.get("eps", 1e-8),
+                                   momentum=op.get("momentum", 0.0))
+    elif optimizer_key == "rprop":
+        etas = op.get("etas", (0.5, 1.2))
+        if isinstance(etas, list): etas = tuple(etas)
+        return torch.optim.Rprop(optim_groups, lr=op.get("lr", 1e-3), etas=etas)
+    elif optimizer_key == "adagrad":
+        return torch.optim.Adagrad(optim_groups, lr=op.get("lr", 1e-2),
+                                   lr_decay=op.get("lr_decay", 0.0),
+                                   eps=op.get("eps", 1e-10))
+    elif optimizer_key == "adadelta":
+        return torch.optim.Adadelta(optim_groups, lr=op.get("lr", 1.0),
+                                    rho=op.get("rho", 0.9),
+                                    eps=op.get("eps", 1e-6))
+    else:
+        raise ValueError(f"Unknown optimizer: {optimizer_key}")
 def wrap_model_with_compile(model, cfg):
     msel = cfg["model_selection"]
     
@@ -3682,11 +3852,22 @@ def train_for_iterations(cfg, model, optimizer, dataset, valid_ds, vocab, line_m
     desc = f"[bench] {name if name else f'model {model_sel}'}"
 
 
+    msel = cfg["model_selection"]
     with tqdm(total=iters_total, desc=desc, ncols=100, leave=False) as pbar:
         while iters < iters_total:
             x, y = fetch()
-            logits = model(x) if cfg["model_selection"] not in RNN_MODEL_IDS else model(x, None)[0]
+            if msel in RNN_MODEL_IDS:
+                logits = model(x, None)[0]
+            elif msel in SCAN_MODEL_IDS:
+                out = model(x); logits = out[0] if isinstance(out, tuple) else out
+            else:
+                logits = model(x)
             loss = criterion(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
+
+            if torch.isnan(loss) or torch.isinf(loss):
+                optimizer.zero_grad(set_to_none=True)
+                iters += 1; pbar.update(1)
+                continue
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
